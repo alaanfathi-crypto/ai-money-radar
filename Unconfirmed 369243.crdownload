@@ -1,0 +1,107 @@
+"""Daily collector for AI Money Radar. Free: standard library only + a free Gemini key."""
+import os, json, re, hashlib, urllib.request, urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+
+FEEDS = {  # name: url. Broken feeds are skipped, so edit this list freely.
+    "Hacker News": "https://hnrss.org/frontpage?points=150",
+    "TLDR AI": "https://tldr.tech/api/rss/ai",
+    "r/SaaS": "https://www.reddit.com/r/SaaS/top/.rss?t=day",
+    "r/Entrepreneur": "https://www.reddit.com/r/Entrepreneur/top/.rss?t=day",
+    "Product Hunt": "https://www.producthunt.com/feed",
+    "Latent Space": "https://www.latent.space/feed",
+    "Import AI": "https://importai.substack.com/feed",
+}
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+KEY = os.environ["GEMINI_API_KEY"]
+KEEP_DAYS, MAX_NEW = 30, 30
+THEMES = "money (ways to earn), tools (tools to try), saas (software ideas), agency (services to sell), mkt (getting customers), world (news that affects regular people)"
+
+PROMPT = """You write a daily brief for a complete beginner who wants to make money with AI and the internet.
+Below are today's headlines as JSON. Pick the {n} most useful for that goal (skip funding rounds, benchmarks, and research unless they open a real opportunity).
+Return ONLY a JSON object: {{"items":[...],"opp":{{...}}}}.
+Each item: {{"i": <input id>, "th": one of [money,tools,saas,agency,mkt,world], "t": plain-English headline under 90 chars, "s": 1-2 short sentences saying what happened, no jargon (explain any technical word), "hy": 0 looks real and checkable, 1 check before trusting, 2 likely a sales pitch, 3 very likely course-selling or scam, "lv": "Easy"|"Medium"|"Hard", "pay": "Low"|"Medium"|"High"|"Keeps you safe", "tags": [1-3 plain lowercase words], "st": [2-4 very simple steps a beginner could follow, each one short sentence, only if there is a real way to earn or protect yourself]}}.
+"opp": {{"t": title, "s": 1-2 sentences, "st": [3 simple steps]}} is the best opportunity across today's items.
+Rules: never invent income numbers or facts that are not in the headline or snippet. If unsure, say so. Be honest about risk. Short words, short sentences.
+Themes: {themes}.
+HEADLINES:
+{data}"""
+
+def get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (AIMoneyRadar personal dashboard)"})
+    return urllib.request.urlopen(req, timeout=25).read()
+
+def clean(s):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or "")).strip()[:300]
+
+def parse(name, raw):
+    root, out = ET.fromstring(raw), []
+    for e in root.iter():
+        tag = e.tag.split("}")[-1]
+        if tag not in ("item", "entry"):
+            continue
+        f = {c.tag.split("}")[-1]: c for c in e}
+        link = (f["link"].text or f["link"].get("href")) if "link" in f else ""
+        if "link" in f and not (f["link"].text or "").strip():
+            link = f["link"].get("href", "")
+        dt = None
+        for k in ("pubDate", "published", "updated"):
+            if k in f and f[k].text:
+                try:
+                    dt = parsedate_to_datetime(f[k].text)
+                except Exception:
+                    try: dt = datetime.fromisoformat(f[k].text.replace("Z", "+00:00"))
+                    except Exception: pass
+                break
+        dt = dt or datetime.now(timezone.utc)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        out.append({"src": name, "title": clean(f["title"].text if "title" in f else ""),
+                    "snippet": clean((f.get("description") or f.get("summary") or f.get("content") or ET.Element("x")).text),
+                    "url": (link or "").strip(), "dt": dt})
+    return out
+
+def ask(prompt):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={KEY}"
+    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
+                       "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}}).encode()
+    req = urllib.request.Request(url, body, {"Content-Type": "application/json"})
+    res = json.load(urllib.request.urlopen(req, timeout=120))
+    return json.loads(res["candidates"][0]["content"]["parts"][0]["text"])
+
+def main():
+    now = datetime.now(timezone.utc)
+    cands = []
+    for name, url in FEEDS.items():
+        try:
+            cands += [x for x in parse(name, get(url)) if x["title"] and x["url"] and now - x["dt"] < timedelta(days=2)]
+        except Exception as ex:
+            print("skipped", name, ex)
+    seen, uniq = set(), []
+    for x in sorted(cands, key=lambda z: z["dt"], reverse=True):
+        if x["url"] not in seen:
+            seen.add(x["url"]); uniq.append(x)
+    uniq = uniq[:60]
+    if not uniq:
+        raise SystemExit("No headlines fetched. Leaving news.json unchanged.")
+    data = [{"id": i, "source": x["src"], "title": x["title"], "snippet": x["snippet"]} for i, x in enumerate(uniq)]
+    res = ask(PROMPT.format(n=MAX_NEW, themes=THEMES, data=json.dumps(data)))
+
+    try: old = json.load(open("news.json"))
+    except Exception: old = {"items": []}
+    new = []
+    for it in res.get("items", []):
+        try: src = uniq[int(it["i"])]
+        except Exception: continue
+        new.append({"id": hashlib.md5(src["url"].encode()).hexdigest()[:10], "date": now.date().isoformat(),
+                    "src": src["src"], "url": src["url"], "th": it.get("th", "tools"), "t": it.get("t", src["title"]),
+                    "s": it.get("s", ""), "hy": int(it.get("hy", 1)), "lv": it.get("lv", "Medium"),
+                    "pay": it.get("pay", "Medium"), "tags": it.get("tags", [])[:3], "st": it.get("st", [])})
+    ids = {x["id"] for x in new}
+    cutoff = (now - timedelta(days=KEEP_DAYS)).date().isoformat()
+    kept = [x for x in old.get("items", []) if x["id"] not in ids and x["date"] >= cutoff]
+    out = {"updated": now.isoformat(), "opp": res.get("opp"), "items": new + kept}
+    json.dump(out, open("news.json", "w"), indent=1, ensure_ascii=False)
+    print("saved", len(new), "new items,", len(kept), "kept")
+
+main()
